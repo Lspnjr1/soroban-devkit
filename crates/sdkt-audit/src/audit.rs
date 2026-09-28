@@ -133,13 +133,13 @@ impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
                 if is_auth_fn(&name) {
                     self.scan.require_auth += 1;
                 }
-                if name == "invoke_contract" {
+                if matches!(name.as_str(), "invoke_contract" | "invoke_contract_light") {
                     self.scan.invoke_contract += 1;
                     self.scan
                         .operation_order
                         .push(OperationMarker::ExternalInvocation);
                 }
-                if matches!(name.as_str(), "set" | "write" | "set_contract_data") {
+                if name == "set_contract_data" {
                     self.scan.operation_order.push(OperationMarker::StateWrite);
                 }
             }
@@ -155,13 +155,13 @@ impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
         if is_auth_fn(&method) {
             self.scan.require_auth += 1;
         }
-        if method == "invoke_contract" {
+        if matches!(method.as_str(), "invoke_contract" | "invoke_contract_light") {
             self.scan.invoke_contract += 1;
             self.scan
                 .operation_order
                 .push(OperationMarker::ExternalInvocation);
         }
-        if matches!(method.as_str(), "set" | "write" | "set_contract_data") {
+        if matches!(method.as_str(), "set" | "write") && is_storage_receiver(&node.receiver) {
             self.scan.operation_order.push(OperationMarker::StateWrite);
         }
         self.count_ident(&node.receiver);
@@ -169,6 +169,21 @@ impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
             self.count_ident(arg);
         }
         visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Avoid treating unrelated collection setters (`HashMap::set`, custom
+/// builders, etc.) as contract storage writes. Recognize the Soroban storage
+/// access chain syntactically; this remains a source heuristic, not type-aware
+/// data-flow analysis.
+fn is_storage_receiver(expr: &Expr) -> bool {
+    match expr {
+        Expr::MethodCall(call) => call.method == "storage" || is_storage_receiver(&call.receiver),
+        Expr::Field(field) => is_storage_receiver(&field.base),
+        Expr::Paren(paren) => is_storage_receiver(&paren.expr),
+        Expr::Reference(reference) => is_storage_receiver(&reference.expr),
+        Expr::Group(group) => is_storage_receiver(&group.expr),
+        _ => false,
     }
 }
 
@@ -398,6 +413,47 @@ mod tests {
         let src = "pub fn foo(a: Address) { bar(a); }";
         let rep = report_for(src);
         assert!(!has(&rep, "MOVE-001"));
+    }
+
+    #[test]
+    fn cei001_detects_light_invocation_and_real_storage_write_once_per_function() {
+        let src = r#"
+            pub fn vulnerable(env: Env) {
+                env.invoke_contract_light(&addr, &func, &args);
+                env.storage().persistent().set(&key, &value);
+                env.storage().instance().set(&other, &value);
+            }
+        "#;
+        let report = report_for(src);
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "CEI-001")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cei001_ignores_unrelated_collection_set_and_can_be_disabled() {
+        let src = r#"
+            pub fn safe(map: HashMap<K, V>, env: Env) {
+                env.invoke_contract(&addr, &func, &args);
+                map.set(key, value);
+            }
+        "#;
+        let report = report_for(src);
+        assert!(!has(&report, "CEI-001"));
+
+        let src = r#"
+            pub fn vulnerable(env: Env) {
+                env.invoke_contract_light(&addr, &func, &args);
+                env.storage().instance().set(&key, &value);
+            }
+        "#;
+        let disabled = audit_source_with(src, &["CEI-001"]).unwrap();
+        assert!(!has(&disabled, "CEI-001"));
     }
 
     #[test]

@@ -67,6 +67,8 @@ sdkt
 ├── tx
 │   ├── inspect <hash>        [--format]
 │   ├── validate <xdr>        [--format] (offline parse + structural checks)
+│   ├── wrap                  --envelope <xdr|file> --fee-source <identity|G...>
+│   │                         --fee <stroops> [--format] (offline fee-bump wrap)
 │   ├── simulate <xdr>        [--format] [--abi <wasm>] [--abi-contract <id>] (RPC; surfaces restore preambles, costs, state changes; ABI-aware result decoding. `--abi-contract` fetches the deployed contract's on-chain WASM for decoding)
 │   ├── sign                  [--input <xdr|file>] [--output <file>] [--identity <name>] [--network <testnet|mainnet|futurenet|custom:<p>>] [--format] (offline ED25519 signing)
 │   ├── submit <xdr>          [--wait] [--timeout <s>] [--interval <s>] [--format] (RPC)
@@ -519,7 +521,9 @@ Store root precedence (lowest → highest): `<cwd>/.sdkt/plugins`,
 
 - `--format json` is supported on all read-style commands, every `plugin` subcommand, and on `diff`, `audit`, `deploy`, `init` for scripting / CI.
 - `diff --upgrade-safety` and `deploy --deny-breaking` implement the Upgrade Safety Guard (see `ROADMAP.md`).
-- `audit` implements the static-analysis rules (AUTH-001/002/003/004, MOVE-001).
+- `audit` implements the static-analysis rules (AUTH-001/002/003/004, MOVE-001, CEI-001).
+- `CEI-001` is a source-level ordering heuristic: it flags recognized contract invocations that precede recognized Soroban storage writes. It recognizes `invoke_contract`/`invoke_contract_light` and storage access chains; it is not type-aware and should be reviewed alongside the source.
+- `tx wrap` builds a fee-bump envelope around a V1 transaction without submitting it. Review the wrapped envelope, then sign and submit it with the usual `tx sign` and `tx submit` commands.
 - `audit --list-rules` discovers all registered built-in rules (with id, severity, and description). Supports `--format json` and does not require a source path argument.
 - **Mainnet safety.** Mutating commands (`tx submit`, `invoke`, `deploy`, `project deploy`) refuse to target mainnet unless you explicitly select the network — via `--network-profile`, `--rpc-url`, or `--network-passphrase`. A testnet-default passphrase pointed at a mainnet endpoint is rejected before any request is sent, protecting against signing for the wrong network.
 

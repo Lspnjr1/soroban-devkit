@@ -33,7 +33,9 @@ pub struct FeeBumpEnvelopeResult {
 
 /// Wrap a plain V1 transaction envelope in a fee-bump envelope.
 ///
-/// Stellar requires the outer fee to be at least the inner transaction fee.
+/// Stellar's fee-bump minimum includes an additional operation fee for the
+/// outer envelope. The inner fee per operation is retained when determining
+/// that increment, including when it is above the network's default base fee.
 /// The inner V1 envelope, including any existing signatures, is copied intact
 /// into the fee-bump envelope and can be signed independently afterward.
 pub fn wrap_fee_bump_transaction(
@@ -60,12 +62,34 @@ pub fn wrap_fee_bump_transaction(
         }
     };
     let inner_fee = i64::from(inner.tx.fee);
+    let inner_operations = u128::try_from(inner.tx.operations.len())
+        .map_err(|_| DecodeError::Extraction("invalid inner operation count".into()))?;
+    if inner_operations == 0 {
+        return Err(DecodeError::Extraction(
+            "fee-bump wrapping requires an inner transaction with at least one operation".into(),
+        ));
+    }
+    if inner_fee < 0 {
+        return Err(DecodeError::Extraction(
+            "fee-bump wrapping requires a non-negative inner fee".into(),
+        ));
+    }
+    let inner_fee_u128 = inner_fee as u128;
+    let outer_operations = inner_operations + 1;
+    let protocol_base_floor = 100u128 * outer_operations;
+    let proportional_floor = inner_fee_u128
+        .checked_mul(outer_operations)
+        .ok_or_else(|| DecodeError::Extraction("minimum fee calculation overflow".into()))?
+        .div_ceil(inner_operations);
+    let required_minimum = inner_fee_u128
+        .max(protocol_base_floor)
+        .max(proportional_floor);
     let fee_bump_total = i64::try_from(fee)
         .map_err(|_| DecodeError::Extraction("fee exceeds the XDR int64 range".into()))?;
-    if fee_bump_total < inner_fee {
+    if (fee_bump_total as u128) < required_minimum {
         return Err(DecodeError::Extraction(format!(
-            "fee-bump fee {} is below the required minimum of {} stroops (the inner fee)",
-            fee_bump_total, inner_fee
+            "fee-bump fee {} is below the required minimum of {} stroops for {} inner operation(s)",
+            fee_bump_total, required_minimum, inner_operations
         )));
     }
     let account = decode_account_id(fee_source)?;
@@ -1991,6 +2015,106 @@ mod extend_tests {
 }
 
 #[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::builder::{build_restore_footprint_tx, RestoreFootprintParams};
+    use stellar_xdr::{
+        ContractDataDurability, ContractId, Hash, LedgerFootprint, LedgerKey,
+        LedgerKeyContractData, OperationBody, ScAddress, SorobanResources, SorobanTransactionData,
+        SorobanTransactionDataExt, TransactionExt,
+    };
+
+    fn soroban_data() -> SorobanTransactionData {
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([1; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::try_from(vec![key]).unwrap(),
+                    read_write: VecM::default(),
+                },
+                instructions: 1000,
+                disk_read_bytes: 500,
+                write_bytes: 200,
+            },
+            resource_fee: 10_000,
+        }
+    }
+
+    fn params(data: SorobanTransactionData, sequence: i64, fee: u32) -> RestoreFootprintParams {
+        RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence,
+            fee,
+            soroban_data: data,
+        }
+    }
+
+    #[test]
+    fn restore_footprint_round_trips_the_preamble_and_operation() {
+        let envelope = build_restore_footprint_tx(&params(soroban_data(), 10, 10_000)).unwrap();
+        let raw = STANDARD.decode(envelope).unwrap();
+        let mut cursor = std::io::Cursor::new(raw);
+        let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+        let env = TransactionEnvelope::read_xdr(&mut limited).unwrap();
+        match env {
+            TransactionEnvelope::Tx(v1) => {
+                assert_eq!(v1.tx.seq_num.0, 10);
+                assert!(matches!(
+                    v1.tx.operations[0].body,
+                    OperationBody::RestoreFootprint(_)
+                ));
+                match &v1.tx.ext {
+                    TransactionExt::V1(data) => {
+                        assert_eq!(data.resource_fee, 10_000);
+                        assert_eq!(data.resources.instructions, 1000);
+                        assert!(!data.resources.footprint.read_only.is_empty());
+                    }
+                    other => panic!("expected V1 extension, got {other:?}"),
+                }
+            }
+            other => panic!("expected V1 envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_footprint_preserves_the_full_preamble_footprint() {
+        let data = soroban_data();
+        let expected = data.resources.footprint.read_only.clone();
+        let envelope = build_restore_footprint_tx(&params(data, 11, 10_000)).unwrap();
+        let raw = STANDARD.decode(envelope).unwrap();
+        let mut cursor = std::io::Cursor::new(raw);
+        let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+        let TransactionEnvelope::Tx(v1) = TransactionEnvelope::read_xdr(&mut limited).unwrap()
+        else {
+            panic!("expected V1 envelope")
+        };
+        let TransactionExt::V1(data) = v1.tx.ext else {
+            panic!("expected Soroban transaction data")
+        };
+        assert_eq!(data.resources.footprint.read_only, expected);
+    }
+
+    #[test]
+    fn restore_footprint_enforces_fee_floor_and_rejects_empty_footprint() {
+        assert!(build_restore_footprint_tx(&params(soroban_data(), 12, 10_000)).is_ok());
+        let err = build_restore_footprint_tx(&params(soroban_data(), 13, 9_999)).unwrap_err();
+        assert!(err.to_string().contains("below the preamble resource fee"));
+        let mut empty = soroban_data();
+        empty.resources.footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: VecM::default(),
+        };
+        let err = build_restore_footprint_tx(&params(empty, 14, 10_000)).unwrap_err();
+        assert!(err.to_string().contains("footprint is empty"));
+    }
+}
+
+#[cfg(test)]
 mod fee_bump_tests {
     use super::*;
     use stellar_xdr::{Limited, Limits, ReadXdr, TransactionEnvelope};
@@ -2056,7 +2180,45 @@ mod fee_bump_rejection_tests {
 
     #[test]
     fn wrap_rejects_fee_below_inner_fee() {
-        let err = wrap_fee_bump_transaction(&plain_envelope(), SOURCE, 99).unwrap_err();
-        assert!(err.to_string().contains("required minimum of 100 stroops"));
+        let err = wrap_fee_bump_transaction(&plain_envelope(), SOURCE, 199).unwrap_err();
+        assert!(err.to_string().contains("required minimum of 200 stroops"));
+    }
+
+    #[test]
+    fn wrap_uses_inner_operation_count_for_minimum_fee() {
+        let envelope = plain_envelope();
+        let raw = STANDARD.decode(envelope).unwrap();
+        let mut cursor = std::io::Cursor::new(raw);
+        let mut limited = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+        let mut v1 = match TransactionEnvelope::read_xdr(&mut limited).unwrap() {
+            TransactionEnvelope::Tx(v1) => v1,
+            other => panic!("expected V1 envelope, got {other:?}"),
+        };
+        let mut operations = v1.tx.operations.to_vec();
+        operations.push(operations[0].clone());
+        v1.tx.operations = VecM::try_from(operations).unwrap();
+        let mut encoded = Vec::new();
+        let mut limited = stellar_xdr::Limited::new(&mut encoded, stellar_xdr::Limits::none());
+        TransactionEnvelope::Tx(v1.clone())
+            .write_xdr(&mut limited)
+            .unwrap();
+        let two_operation_envelope = STANDARD.encode(encoded);
+
+        // inner fee 100 / 2 operations implies 50/op, below protocol's 100
+        // stroop base fee. The outer transaction adds its own third op fee.
+        let err = wrap_fee_bump_transaction(&two_operation_envelope, SOURCE, 299).unwrap_err();
+        assert!(err.to_string().contains("required minimum of 300 stroops"));
+        assert!(wrap_fee_bump_transaction(&two_operation_envelope, SOURCE, 300).is_ok());
+
+        // At a higher inner rate the proportional floor, not just the fixed
+        // protocol floor, controls the 2-op boundary: ceil(300 * 3 / 2)=450.
+        v1.tx.fee = 300;
+        let mut encoded = Vec::new();
+        let mut limited = stellar_xdr::Limited::new(&mut encoded, stellar_xdr::Limits::none());
+        TransactionEnvelope::Tx(v1).write_xdr(&mut limited).unwrap();
+        let high_rate_envelope = STANDARD.encode(encoded);
+        let err = wrap_fee_bump_transaction(&high_rate_envelope, SOURCE, 449).unwrap_err();
+        assert!(err.to_string().contains("required minimum of 450 stroops"));
+        assert!(wrap_fee_bump_transaction(&high_rate_envelope, SOURCE, 450).is_ok());
     }
 }
